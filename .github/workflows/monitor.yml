@@ -24,7 +24,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .pancakeswap_last_tweets.json
-          key: pancakeswap-monitor-state-v1
+          key: pancakeswap-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            pancakeswap-monitor-state-
 
       - name: Install dependencies
         run: |
@@ -32,9 +34,20 @@ jobs:
           pip install playwright requests
           playwright install chromium
 
+      - name: Debug - show state before
+        run: |
+          echo "Current dir: $(pwd)"
+          ls -la .pancakeswap_last_tweets.json 2>/dev/null || echo "State file not found"
+          cat .pancakeswap_last_tweets.json 2>/dev/null || echo "File empty or not found"
+
       - name: Run PancakeSwap monitor
         env:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_ENABLED: 'true'
         run: |
           python monitor_pancakeswap.py
+
+      - name: Debug - show state after
+        run: |
+          echo "State file after run:"
+          cat .pancakeswap_last_tweets.json 2>/dev/null || echo "File not found"
