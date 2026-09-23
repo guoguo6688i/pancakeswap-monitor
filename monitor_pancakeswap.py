@@ -115,25 +115,62 @@ def fetch_tweets_with_playwright():
     tweets = []
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 800}
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                ]
             )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+                timezone_id="America/New_York",
+            )
+
+            # 移除 webdriver 标志
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}};
+            """)
+
             page = context.new_page()
 
             url = f"https://x.com/{X_ACCOUNT}"
             print(f"  [抓取] 正在访问 {url}...")
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            time.sleep(5)
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
-            # 滚动加载更多推文
-            for _ in range(3):
-                page.evaluate("window.scrollBy(0, 800)")
-                time.sleep(2)
+            # 等待页面加载
+            print("  [抓取] 等待页面加载...")
+            time.sleep(8)
 
-            # 提取推文
+            # 尝试等待推文元素出现
+            try:
+                page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
+                print("  [抓取] 推文元素已加载")
+            except Exception:
+                print("  [抓取] 等待推文元素超时，继续尝试...")
+
+            # 多次滚动加载更多推文
+            for scroll_idx in range(4):
+                page.evaluate("window.scrollBy(0, 600)")
+                time.sleep(2.5)
+
+            # 保存截图用于调试
+            try:
+                page.screenshot(path="/tmp/x_page_debug.png", full_page=False)
+                print("  [抓取] 调试截图已保存")
+            except Exception:
+                pass
+
+            # 提取推文（尝试多种选择器）
             tweet_elements = page.query_selector_all('article[data-testid="tweet"]')
+            if not tweet_elements:
+                tweet_elements = page.query_selector_all('article')
             print(f"  [抓取] 找到 {len(tweet_elements)} 条推文")
 
             for i, tweet in enumerate(tweet_elements[:15]):
@@ -141,6 +178,11 @@ def fetch_tweets_with_playwright():
                     # 提取推文文本
                     text_el = tweet.query_selector('div[data-testid="tweetText"]')
                     text = text_el.inner_text() if text_el else ""
+
+                    # 如果没有 text，尝试其他选择器
+                    if not text:
+                        text_els = tweet.query_selector_all('div[dir="auto"]')
+                        text = " ".join([el.inner_text() for el in text_els if el.inner_text()])
 
                     # 提取推文链接
                     link_el = tweet.query_selector('a[href*="/status/"]')
