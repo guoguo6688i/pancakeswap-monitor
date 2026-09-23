@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-PancakeSwap X 账号监测脚本
-监测 @PancakeSwap 的最新推文，发现新的 IFO / Pre-Access / Launchpad / 新币申购活动时发送邮件通知
+PancakeSwap 申购活动监测脚本
+多数据源监测：Google News RSS + X(Twitter)页面抓取 + 官网IFO页面
+发现新的 IFO / Pre-Access / Launchpad / 新币申购活动时发送邮件通知
 """
 
 import os
@@ -9,9 +10,12 @@ import sys
 import json
 import time
 import smtplib
+import hashlib
+import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timezone, timedelta
+from xml.etree import ElementTree
 
 # ============================================================
 # 邮件配置（从环境变量读取）
@@ -34,14 +38,24 @@ STATE_FILE = ".pancakeswap_last_tweets.json"
 
 # 申购活动关键词（中英文）
 KEYWORDS = [
-    # 英文
+    # 英文 - IFO相关
     "IFO", "Initial Farm Offering", "Pre-Access", "pre-access", "pre access",
     "Launchpad", "launchpad", "new offering", "new token sale", "token sale",
     "subscription", "subscribe", "whitelist", "public sale", "private sale",
     "new project", "upcoming launch", "new launch", "farm offering",
     "commit CAKE", "commit cake", "raise funds", "fundraising",
+    "new token", "token launch", "IDO", "initial dex offering",
     # 中文
-    "申购", "新币", "发售", "众筹", "白名单", "预售", "上线", "首发",
+    "申购", "新币", "发售", "众筹", "白名单", "预售", "首发", "上线",
+]
+
+# Google News 搜索关键词组合
+NEWS_QUERIES = [
+    "PancakeSwap IFO",
+    "PancakeSwap Launchpad",
+    "PancakeSwap Pre-Access",
+    "PancakeSwap new token offering",
+    "PancakeSwap 申购",
 ]
 
 # ============================================================
@@ -84,14 +98,14 @@ def send_email(subject, body):
 # 状态管理
 # ============================================================
 def load_state():
-    """加载已检测的推文状态"""
+    """加载已检测的状态"""
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
-    return {"seen_tweet_ids": [], "last_check": None}
+    return {"seen_ids": [], "last_check": None}
 
 def save_state(state):
     """保存状态"""
@@ -101,15 +115,67 @@ def save_state(state):
     except Exception as e:
         print(f"  [状态] 保存失败: {e}")
 
+def make_id(text, source):
+    """生成内容唯一ID"""
+    return hashlib.md5(f"{source}:{text}".encode()).hexdigest()[:16]
+
 # ============================================================
-# X 推文抓取（使用 Playwright）
+# 数据源1：Google News RSS
 # ============================================================
-def fetch_tweets_with_playwright():
+def fetch_from_google_news():
+    """从 Google News RSS 搜索 PancakeSwap 申购相关新闻"""
+    import requests
+    results = []
+
+    for query in NEWS_QUERIES:
+        try:
+            url = f"https://news.google.com/rss/search?q={requests.utils.quote(query)}&hl=en-US&gl=US&ceid=US:en"
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            resp = requests.get(url, headers=headers, timeout=15)
+
+            if resp.status_code != 200 or not resp.text:
+                print(f"  [News] 查询 '{query}' 返回状态 {resp.status_code}")
+                continue
+
+            # 解析 RSS
+            root = ElementTree.fromstring(resp.text)
+            items = root.findall(".//item")
+            print(f"  [News] 查询 '{query}' 找到 {len(items)} 条新闻")
+
+            for item in items[:10]:
+                title = item.findtext("title", "")
+                link = item.findtext("link", "")
+                pub_date = item.findtext("pubDate", "")
+                source = item.findtext("source", "")
+
+                # 清理标题（Google News 标题格式："标题 - 来源"）
+                clean_title = re.sub(r'\s+-\s+[^-]+$', '', title).strip()
+
+                if clean_title and link:
+                    results.append({
+                        "id": make_id(clean_title, "google_news"),
+                        "title": clean_title,
+                        "text": clean_title,
+                        "link": link,
+                        "time": pub_date,
+                        "source": f"Google News ({source})" if source else "Google News",
+                        "query": query,
+                    })
+        except Exception as e:
+            print(f"  [News] 查询 '{query}' 失败: {e}")
+            continue
+
+    return results
+
+# ============================================================
+# 数据源2：X(Twitter) 页面抓取（Playwright）
+# ============================================================
+def fetch_from_x():
     """使用 Playwright 抓取 X 账号最新推文"""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print("  [抓取] Playwright 未安装，尝试备用方案")
+        print("  [X] Playwright 未安装，跳过")
         return []
 
     tweets = []
@@ -117,125 +183,114 @@ def fetch_tweets_with_playwright():
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                ]
+                args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
             )
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 viewport={"width": 1280, "height": 900},
                 locale="en-US",
-                timezone_id="America/New_York",
             )
-
-            # 移除 webdriver 标志
             context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
                 window.chrome = {runtime: {}};
             """)
 
             page = context.new_page()
-
             url = f"https://x.com/{X_ACCOUNT}"
-            print(f"  [抓取] 正在访问 {url}...")
+            print(f"  [X] 正在访问 {url}...")
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
-
-            # 等待页面加载
-            print("  [抓取] 等待页面加载...")
             time.sleep(8)
 
-            # 尝试等待推文元素出现
             try:
                 page.wait_for_selector('article[data-testid="tweet"]', timeout=15000)
-                print("  [抓取] 推文元素已加载")
-            except Exception:
-                print("  [抓取] 等待推文元素超时，继续尝试...")
-
-            # 多次滚动加载更多推文
-            for scroll_idx in range(4):
-                page.evaluate("window.scrollBy(0, 600)")
-                time.sleep(2.5)
-
-            # 保存截图用于调试
-            try:
-                page.screenshot(path="/tmp/x_page_debug.png", full_page=False)
-                print("  [抓取] 调试截图已保存")
             except Exception:
                 pass
 
-            # 提取推文（尝试多种选择器）
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, 600)")
+                time.sleep(2)
+
             tweet_elements = page.query_selector_all('article[data-testid="tweet"]')
             if not tweet_elements:
                 tweet_elements = page.query_selector_all('article')
-            print(f"  [抓取] 找到 {len(tweet_elements)} 条推文")
+            print(f"  [X] 找到 {len(tweet_elements)} 条推文")
 
-            for i, tweet in enumerate(tweet_elements[:15]):
+            for tweet in tweet_elements[:15]:
                 try:
-                    # 提取推文文本
                     text_el = tweet.query_selector('div[data-testid="tweetText"]')
                     text = text_el.inner_text() if text_el else ""
-
-                    # 如果没有 text，尝试其他选择器
                     if not text:
                         text_els = tweet.query_selector_all('div[dir="auto"]')
                         text = " ".join([el.inner_text() for el in text_els if el.inner_text()])
 
-                    # 提取推文链接
                     link_el = tweet.query_selector('a[href*="/status/"]')
                     link = link_el.get_attribute("href") if link_el else ""
                     if link and not link.startswith("http"):
                         link = "https://x.com" + link
 
-                    # 提取时间
                     time_el = tweet.query_selector("time")
                     tweet_time = time_el.get_attribute("datetime") if time_el else ""
 
-                    # 提取推文 ID
                     tweet_id = ""
                     if "/status/" in link:
                         tweet_id = link.split("/status/")[1].split("/")[0].split("?")[0]
 
                     if text and tweet_id:
                         tweets.append({
-                            "id": tweet_id,
+                            "id": make_id(tweet_id, "x"),
+                            "title": text[:80],
                             "text": text,
                             "link": link,
                             "time": tweet_time,
+                            "source": f"X (@{X_ACCOUNT})",
                         })
-                except Exception as e:
-                    print(f"  [抓取] 解析第 {i} 条推文失败: {e}")
+                except Exception:
                     continue
 
             browser.close()
     except Exception as e:
-        print(f"  [抓取] Playwright 抓取失败: {e}")
+        print(f"  [X] 抓取失败: {e}")
 
     return tweets
 
 # ============================================================
-# 备用方案：使用 X syndication API
+# 数据源3：PancakeSwap 官网 IFO 页面
 # ============================================================
-def fetch_tweets_with_api():
-    """使用 X syndication API 作为备用方案"""
+def fetch_from_website():
+    """监测 PancakeSwap 官网 IFO 页面变化"""
     import requests
-    tweets = []
+    results = []
     try:
-        url = f"https://cdn.syndication.twimg.com/timeline/profile?screen_name={X_ACCOUNT}"
-        headers = {"User-Agent": "Mozilla/5.0"}
+        url = "https://pancakeswap.finance/ifo"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200 and resp.text:
-            data = resp.json()
-            # 解析返回的 HTML 内容提取推文
-            # 这个 API 返回的是嵌入用的 HTML，需要解析
-            print(f"  [API] syndication 返回 {len(resp.text)} 字节")
-    except Exception as e:
-        print(f"  [API] syndication 失败: {e}")
 
-    return tweets
+        if resp.status_code == 200 and resp.text:
+            # 检查页面中是否有 IFO 相关内容
+            text = resp.text
+            ifo_keywords = ["upcoming", "active", "IFO", "offering"]
+            found = [kw for kw in ifo_keywords if kw.lower() in text.lower()]
+
+            if found:
+                # 提取页面标题
+                title_match = re.search(r'<title>([^<]+)</title>', text)
+                title = title_match.group(1) if title_match else "PancakeSwap IFO 页面更新"
+
+                results.append({
+                    "id": make_id(f"ifo_page_{datetime.now().strftime('%Y%m%d')}", "website"),
+                    "title": title,
+                    "text": f"PancakeSwap IFO 页面包含关键词: {', '.join(found)}",
+                    "link": url,
+                    "time": datetime.now().isoformat(),
+                    "source": "PancakeSwap 官网",
+                })
+                print(f"  [官网] IFO 页面检测到关键词: {', '.join(found)}")
+            else:
+                print("  [官网] IFO 页面未检测到活动关键词")
+    except Exception as e:
+        print(f"  [官网] 访问失败: {e}")
+
+    return results
 
 # ============================================================
 # 关键词匹配
@@ -256,55 +311,68 @@ def main():
     print("=" * 55)
     print("  PancakeSwap 申购活动监测")
     print("=" * 55)
-    print(f"  监测账号: @{X_ACCOUNT}")
     print(f"  监测时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  📧 邮件推送: {'已启用' if EMAIL_CONFIG.get('enabled') else '未启用'} → {', '.join(EMAIL_CONFIG['receivers'])}")
     print()
 
     # 加载状态
     state = load_state()
-    seen_ids = set(state.get("seen_tweet_ids", []))
-    print(f"  已记录推文: {len(seen_ids)} 条")
+    seen_ids = set(state.get("seen_ids", []))
+    print(f"  已记录内容: {len(seen_ids)} 条")
 
-    # 抓取推文
+    # 从多个数据源获取内容
+    all_items = []
+
     print()
-    print("  正在抓取最新推文...")
-    tweets = fetch_tweets_with_playwright()
+    print("  [数据源1] Google News RSS...")
+    news_items = fetch_from_google_news()
+    all_items.extend(news_items)
 
-    if not tweets:
-        print("  Playwright 抓取失败，尝试备用方案...")
-        tweets = fetch_tweets_with_api()
-
-    if not tweets:
-        print("  ⚠️ 无法获取推文，本次监测结束")
-        state["last_check"] = datetime.now().isoformat()
-        save_state(state)
-        return
-
-    print(f"  成功获取 {len(tweets)} 条最新推文")
     print()
+    print("  [数据源2] X(Twitter) 页面...")
+    x_items = fetch_from_x()
+    all_items.extend(x_items)
+
+    print()
+    print("  [数据源3] PancakeSwap 官网...")
+    web_items = fetch_from_website()
+    all_items.extend(web_items)
+
+    print()
+    print(f"  共获取 {len(all_items)} 条内容")
+
+    # 去重
+    unique_items = []
+    seen_in_batch = set()
+    for item in all_items:
+        if item["id"] not in seen_in_batch:
+            seen_in_batch.add(item["id"])
+            unique_items.append(item)
+
+    print(f"  去重后 {len(unique_items)} 条")
 
     # 检测新的申购活动
     new_activities = []
-    for tweet in tweets:
-        if tweet["id"] in seen_ids:
+    for item in unique_items:
+        if item["id"] in seen_ids:
             continue
 
-        matched = match_keywords(tweet["text"])
+        matched = match_keywords(item["text"])
         if matched:
             new_activities.append({
-                **tweet,
+                **item,
                 "matched_keywords": matched,
             })
 
-    # 更新已见推文 ID
-    for tweet in tweets:
-        seen_ids.add(tweet["id"])
-    state["seen_tweet_ids"] = list(seen_ids)[-200:]  # 只保留最近200条
+    # 更新已见ID
+    for item in unique_items:
+        seen_ids.add(item["id"])
+    state["seen_ids"] = list(seen_ids)[-500:]  # 保留最近500条
     state["last_check"] = datetime.now().isoformat()
     save_state(state)
 
     # 输出结果
+    print()
     print("-" * 55)
     if new_activities:
         print(f"  🚨 发现 {len(new_activities)} 条新的申购活动公告！")
@@ -314,15 +382,16 @@ def main():
         subject = f"🚀 PancakeSwap 新申购活动: {new_activities[0]['matched_keywords'][0]}"
         body = f"发现 PancakeSwap 新的申购活动公告！\n\n"
         body += f"监测时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        body += f"监测账号: @{X_ACCOUNT}\n\n"
+        body += f"数据来源: Google News / X / 官网\n\n"
 
         for i, activity in enumerate(new_activities, 1):
             body += f"{'='*50}\n"
             body += f"【活动 {i}】\n"
             body += f"匹配关键词: {', '.join(activity['matched_keywords'])}\n"
-            body += f"发布时间: {activity['time']}\n"
-            body += f"推文链接: {activity['link']}\n\n"
-            body += f"推文内容:\n{activity['text']}\n\n"
+            body += f"来源: {activity.get('source', '未知')}\n"
+            body += f"发布时间: {activity.get('time', '未知')}\n"
+            body += f"链接: {activity['link']}\n\n"
+            body += f"内容:\n{activity['text'][:500]}\n\n"
 
         body += f"{'='*50}\n"
         body += f"请尽快访问 PancakeSwap 官网查看详情: https://pancakeswap.finance/ifo\n"
@@ -334,12 +403,13 @@ def main():
         # 打印活动摘要
         for i, activity in enumerate(new_activities, 1):
             print(f"\n  【活动 {i}】匹配: {', '.join(activity['matched_keywords'])}")
-            print(f"  时间: {activity['time']}")
+            print(f"  来源: {activity.get('source', '未知')}")
+            print(f"  时间: {activity.get('time', '未知')}")
             print(f"  链接: {activity['link']}")
             print(f"  内容: {activity['text'][:200]}...")
     else:
         print("  ✅ 未发现新的申购活动")
-        print(f"  已扫描 {len(tweets)} 条最新推文，无关键词匹配")
+        print(f"  已扫描 {len(unique_items)} 条内容，无关键词匹配")
 
     print()
     print("=" * 55)
