@@ -119,6 +119,35 @@ def make_id(text, source):
     """生成内容唯一ID"""
     return hashlib.md5(f"{source}:{text}".encode()).hexdigest()[:16]
 
+def parse_date(date_str):
+    """解析日期字符串，返回 datetime 对象"""
+    if not date_str:
+        return None
+    formats = [
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S",
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str.strip(), fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    return None
+
+def is_recent(date_str, days=7):
+    """检查日期是否在最近 N 天内"""
+    dt = parse_date(date_str)
+    if dt is None:
+        return True  # 无法解析日期时保留
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    return dt >= cutoff
+
 # ============================================================
 # 数据源1：Google News RSS
 # ============================================================
@@ -142,11 +171,16 @@ def fetch_from_google_news():
             items = root.findall(".//item")
             print(f"  [News] 查询 '{query}' 找到 {len(items)} 条新闻")
 
-            for item in items[:10]:
+            recent_count = 0
+            for item in items[:20]:
                 title = item.findtext("title", "")
                 link = item.findtext("link", "")
                 pub_date = item.findtext("pubDate", "")
                 source = item.findtext("source", "")
+
+                # 只保留最近7天的新闻
+                if not is_recent(pub_date, days=7):
+                    continue
 
                 # 清理标题（Google News 标题格式："标题 - 来源"）
                 clean_title = re.sub(r'\s+-\s+[^-]+$', '', title).strip()
@@ -161,6 +195,9 @@ def fetch_from_google_news():
                         "source": f"Google News ({source})" if source else "Google News",
                         "query": query,
                     })
+                    recent_count += 1
+
+            print(f"  [News]   其中最近7天: {recent_count} 条")
         except Exception as e:
             print(f"  [News] 查询 '{query}' 失败: {e}")
             continue
@@ -374,31 +411,39 @@ def main():
     # 输出结果
     print()
     print("-" * 55)
+
+    # 判断是否首次运行（基线建立）
+    is_first_run = len(state.get("seen_ids", [])) == 0
+
     if new_activities:
-        print(f"  🚨 发现 {len(new_activities)} 条新的申购活动公告！")
-        print()
+        if is_first_run:
+            print(f"  ℹ️ 首次运行，建立基线，发现 {len(new_activities)} 条历史活动（不发送邮件）")
+            print(f"  后续运行发现新活动时将自动发送邮件通知")
+        else:
+            print(f"  🚨 发现 {len(new_activities)} 条新的申购活动公告！")
+            print()
 
-        # 发送邮件
-        subject = f"🚀 PancakeSwap 新申购活动: {new_activities[0]['matched_keywords'][0]}"
-        body = f"发现 PancakeSwap 新的申购活动公告！\n\n"
-        body += f"监测时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        body += f"数据来源: Google News / X / 官网\n\n"
+            # 发送邮件
+            subject = f"🚀 PancakeSwap 新申购活动: {new_activities[0]['matched_keywords'][0]}"
+            body = f"发现 PancakeSwap 新的申购活动公告！\n\n"
+            body += f"监测时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            body += f"数据来源: Google News / X / 官网\n\n"
 
-        for i, activity in enumerate(new_activities, 1):
+            for i, activity in enumerate(new_activities, 1):
+                body += f"{'='*50}\n"
+                body += f"【活动 {i}】\n"
+                body += f"匹配关键词: {', '.join(activity['matched_keywords'])}\n"
+                body += f"来源: {activity.get('source', '未知')}\n"
+                body += f"发布时间: {activity.get('time', '未知')}\n"
+                body += f"链接: {activity['link']}\n\n"
+                body += f"内容:\n{activity['text'][:500]}\n\n"
+
             body += f"{'='*50}\n"
-            body += f"【活动 {i}】\n"
-            body += f"匹配关键词: {', '.join(activity['matched_keywords'])}\n"
-            body += f"来源: {activity.get('source', '未知')}\n"
-            body += f"发布时间: {activity.get('time', '未知')}\n"
-            body += f"链接: {activity['link']}\n\n"
-            body += f"内容:\n{activity['text'][:500]}\n\n"
+            body += f"请尽快访问 PancakeSwap 官网查看详情: https://pancakeswap.finance/ifo\n"
+            body += f"\n本邮件由 PancakeSwap 监测脚本自动发送"
 
-        body += f"{'='*50}\n"
-        body += f"请尽快访问 PancakeSwap 官网查看详情: https://pancakeswap.finance/ifo\n"
-        body += f"\n本邮件由 PancakeSwap 监测脚本自动发送"
-
-        print(f"  正在发送邮件通知...")
-        send_email(subject, body)
+            print(f"  正在发送邮件通知...")
+            send_email(subject, body)
 
         # 打印活动摘要
         for i, activity in enumerate(new_activities, 1):
