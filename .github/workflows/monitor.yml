@@ -2,7 +2,9 @@ name: PancakeSwap IFO Monitor
 
 on:
   schedule:
-    - cron: '30 */12 * * *'  # 每12小时运行一次（UTC 0:30和12:30，北京时间8:30和20:30）
+    # 每12小时运行一次；错峰至每小时第47分（避开整点/半点/一刻钟高峰）
+    # UTC 0:47 和 12:47，北京时间 8:47 和 20:47
+    - cron: '47 */12 * * *'
   workflow_dispatch:  # 支持手动触发
 
 env:
